@@ -25,6 +25,7 @@ import sys
 KNOWN = {
     "GEMINI_API_KEY": "Gemini TTS narration · free key at aistudio.google.com/apikey",
     "ELEVENLABS_API_KEY": "ElevenLabs narration (optional) · elevenlabs.io > Profile > API keys",
+    "OPENROUTER_API_KEY": "Gemini TTS through OpenRouter (optional) · openrouter.ai/settings/keys",
     "PIXABAY_API_KEY": "Pixabay stock photos and videos · free key at pixabay.com/api/docs",
 }
 

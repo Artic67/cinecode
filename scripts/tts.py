@@ -21,6 +21,8 @@ A chorus is one run per voice. No style is the default: it follows the film's vo
 Engines
   gemini      GEMINI_API_KEY · model gemini-3.8-flash-tts (or gemini-3.8-flash-lite-tts) · named voices (e.g. Kore,
               Puck, Charon) · delivery in plain words through speech_metadata.style ("warm and curious", "deadpan")
+  openrouter  OPENROUTER_API_KEY · the same Gemini TTS voices through OpenRouter (model google/gemini-3.8-flash-tts) ·
+              --style goes as "instructions" · raw 24 kHz PCM, made into the same 48 kHz WAV as the gemini engine
   elevenlabs  ELEVENLABS_API_KEY · --voice <voice_id> from your voice library · model eleven_v3 (70+ languages,
               audio tags such as [excited], [laughs], [whispers]) or eleven_multilingual_v2 (steady multilingual
               narration, no tags)
@@ -43,6 +45,7 @@ import keys  # noqa: E402  (same folder: the key store shared by every film)
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 ELEVEN_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice}?output_format=mp3_44100_128"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/audio/speech"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -59,8 +62,9 @@ def post(url, body, headers, timeout=120):
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:800]
         for value in headers.values():                   # a service that echoes the key never gets it printed
-            if value and len(str(value)) >= 8 and "/" not in str(value):
-                detail = detail.replace(str(value), "<key>")
+            value = str(value or "").removeprefix("Bearer ")
+            if len(value) >= 8 and "/" not in value:
+                detail = detail.replace(value, "<key>")
         raise RuntimeError(f"HTTP {e.code}: {detail}") from None
 
 
@@ -120,6 +124,58 @@ def eleven_request(text, style, model, seed, stability):
     if seed is not None:
         body["seed"] = seed
     return body
+
+
+OPENROUTER_PCM_RATE = 24000   # Gemini TTS speaks raw 16-bit little-endian mono PCM at 24 kHz
+
+
+def openrouter_request(text, style, voice, model):
+    body = {"model": model, "input": text, "voice": voice, "response_format": "pcm"}
+    if style:
+        body["instructions"] = style                 # delivery in plain words, like Gemini's speech_metadata.style
+    return body
+
+
+def pcm_to_wav_bytes(pcm, rate=OPENROUTER_PCM_RATE):
+    """Raw s16le mono PCM wrapped in a WAV header, so ffmpeg (to_wav) reads it like any other take."""
+    import io
+    import wave
+    if len(pcm) % 2:
+        pcm = pcm[:-1]                               # a stray half-sample would shift every sample after it
+    if not pcm:
+        raise RuntimeError("no audio in the OpenRouter response")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+ENGINE_KEYS = {"gemini": "GEMINI_API_KEY", "elevenlabs": "ELEVENLABS_API_KEY", "openrouter": "OPENROUTER_API_KEY"}
+DEFAULT_MODELS = {"gemini": "gemini-3.8-flash-tts", "elevenlabs": "eleven_v3", "openrouter": "google/gemini-3.8-flash-tts"}
+
+
+def engine_request(engine, text, style, voice, model, a, key):
+    """(url, body, headers) for one line with an HTTP engine."""
+    if engine == "gemini":
+        return GEMINI_URL, gemini_request(text, style, voice, model), \
+            {"x-goog-api-key": key or "", "Content-Type": "application/json"}
+    if engine == "openrouter":
+        return OPENROUTER_URL, openrouter_request(text, style, voice, model), \
+            {"Authorization": f"Bearer {key or ''}", "Content-Type": "application/json"}
+    return ELEVEN_URL.format(voice=voice or "<voice_id>"), eleven_request(text, style, model, a.seed, a.stability), \
+        {"xi-api-key": key or "", "Content-Type": "application/json"}
+
+
+def engine_audio(engine, raw):
+    """The response as bytes ffmpeg can decode."""
+    if engine == "gemini":
+        return gemini_audio(raw)
+    if engine == "openrouter":
+        return pcm_to_wav_bytes(raw)
+    return raw
 
 
 def to_wav(data, dst):
@@ -185,18 +241,12 @@ def synth(engine, model, voice, text, style, a, dst):
         if ema_missing():
             raise RuntimeError(ema_missing())
         return ema_takes([(text, dst)], a.seed, a.speed)[0]
-    if engine == "gemini":
-        key = keys.get("GEMINI_API_KEY")
-        body, url = gemini_request(text, style, voice, model), GEMINI_URL
-        headers = {"x-goog-api-key": key or "", "Content-Type": "application/json"}
-    else:
-        key = keys.get("ELEVENLABS_API_KEY")
-        body, url = eleven_request(text, style, model, a.seed, a.stability), ELEVEN_URL.format(voice=voice)
-        headers = {"xi-api-key": key or "", "Content-Type": "application/json"}
+    key = keys.get(ENGINE_KEYS[engine])
     if not key:
-        raise RuntimeError(f"{'GEMINI' if engine == 'gemini' else 'ELEVENLABS'}_API_KEY is not set (tools/keys.py open)")
+        raise RuntimeError(f"{ENGINE_KEYS[engine]} is not set (tools/keys.py open)")
+    url, body, headers = engine_request(engine, text, style, voice, model, a, key)
     raw, _ = post_patiently(url, body, headers)
-    return to_wav(gemini_audio(raw) if engine == "gemini" else raw, dst)
+    return to_wav(engine_audio(engine, raw), dst)
 
 
 def auditioned(root="."):
@@ -210,6 +260,11 @@ def auditioned(root="."):
     return False
 
 
+def model_engine(model):
+    """Which engine a --model name belongs to (OpenRouter names carry a provider prefix such as google/)."""
+    return "openrouter" if "/" in model else "gemini" if model.startswith("gemini") else "elevenlabs"
+
+
 def audition(a):
     if not a.text:
         sys.exit("--audition needs --text: one line of the script (about 8-15 words), the same for every voice")
@@ -218,11 +273,15 @@ def audition(a):
     for n, cand in enumerate(cands, 1):
         engine, _, voice = cand.partition(":")
         voice = voice or ("tr" if engine == "ema" else "")
-        if engine not in ("gemini", "elevenlabs", "ema") or not voice:
-            print(f"{n}. skipped '{cand}': write engine:voice (gemini:Kore, elevenlabs:<voice_id>, ema)")
+        if engine not in ("gemini", "elevenlabs", "openrouter", "ema") or not voice:
+            print(f"{n}. skipped '{cand}': write engine:voice (gemini:Kore, openrouter:Kore, elevenlabs:<voice_id>, ema)")
             continue
-        model = "ema-lightning" if engine == "ema" else a.model if a.model and (a.model.startswith("gemini") == (engine == "gemini")) else \
-            ("gemini-3.8-flash-tts" if engine == "gemini" else "eleven_v3")
+        if engine == "ema":
+            model = "ema-lightning"
+        elif a.model and model_engine(a.model) == engine:
+            model = a.model
+        else:
+            model = DEFAULT_MODELS[engine]
         name = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in voice)[:24]
         dst = os.path.join(a.out, f"{n}-{engine}-{name}.wav")
         if a.dry_run:
@@ -276,15 +335,17 @@ def ema_lines(a, lines):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["gemini", "elevenlabs", "ema"], default=os.environ.get("TTS_ENGINE", "gemini"))
+    ap.add_argument("--engine", choices=["gemini", "elevenlabs", "openrouter", "ema"],
+                    default=os.environ.get("TTS_ENGINE", "gemini"))
     ap.add_argument("--install", choices=["ema"], help="ema: install EMA Lightning (about 800 MB, once; ask the user first)")
     ap.add_argument("--speed", type=float, default=1.0, help="ema: 0.25 to 4")
     ap.add_argument("--lines", help="vo-lines.json")
     ap.add_argument("--text", help="one line instead of --lines")
     ap.add_argument("--id", default="VO1")
     ap.add_argument("--out", help="the folder for the takes (needed for everything but --install)")
-    ap.add_argument("--voice", help="gemini: voice name (default Charon); elevenlabs: voice_id (required)")
-    ap.add_argument("--model", help="gemini-3.8-flash-tts | gemini-3.8-flash-lite-tts | eleven_v3 | eleven_multilingual_v2")
+    ap.add_argument("--voice", help="gemini, openrouter: voice name (default Charon); elevenlabs: voice_id (required)")
+    ap.add_argument("--model", help="gemini-3.8-flash-tts | gemini-3.8-flash-lite-tts | google/gemini-3.8-flash-tts "
+                                    "(openrouter) | eleven_v3 | eleven_multilingual_v2")
     ap.add_argument("--style", default="", help='delivery from the sound identity (default: none)')
     ap.add_argument("--seed", type=int, default=7, help="elevenlabs: best-effort repeatable takes")
     ap.add_argument("--stability", type=float, default=0.45, help="elevenlabs: lower = more expressive")
@@ -318,12 +379,10 @@ def main():
 
     if a.engine == "ema":
         return ema_lines(a, lines)
-    if a.engine == "gemini":
-        key_name, model, voice = "GEMINI_API_KEY", a.model or "gemini-3.8-flash-tts", a.voice or "Charon"
-    else:
-        key_name, model, voice = "ELEVENLABS_API_KEY", a.model or "eleven_v3", a.voice
-        if not voice and not a.dry_run:
-            sys.exit("elevenlabs needs --voice <voice_id> (from your ElevenLabs voice library)")
+    key_name, model = ENGINE_KEYS[a.engine], a.model or DEFAULT_MODELS[a.engine]
+    voice = a.voice if a.engine == "elevenlabs" else a.voice or "Charon"
+    if a.engine == "elevenlabs" and not voice and not a.dry_run:
+        sys.exit("elevenlabs needs --voice <voice_id> (from your ElevenLabs voice library)")
     key = keys.get(key_name)
     if not key and not a.dry_run:
         sys.exit(f"{key_name} is not set yet. Enter it once for every film: python3 tools/keys.py set {key_name}")
@@ -340,12 +399,7 @@ def main():
             failed.append(ln["id"])
             continue
         style = ln.get("style", a.style)
-        if a.engine == "gemini":
-            body, url = gemini_request(ln["text"], style, voice, model), GEMINI_URL
-            headers = {"x-goog-api-key": key or "", "Content-Type": "application/json"}
-        else:
-            body, url = eleven_request(ln["text"], style, model, a.seed, a.stability), ELEVEN_URL.format(voice=voice or "<voice_id>")
-            headers = {"xi-api-key": key or "", "Content-Type": "application/json"}
+        url, body, headers = engine_request(a.engine, ln["text"], style, voice, model, a, key)
         if a.dry_run:
             print(f"{ln['id']}: {a.engine} {model} voice={voice} POST {url.split('?')[0]}")
             print("   " + json.dumps(body, ensure_ascii=False)[:240])
@@ -354,8 +408,7 @@ def main():
         tmp = os.path.join(a.out, f".{ln['id']}.new.wav")
         try:
             raw, _ = post_patiently(url, body, headers)
-            audio = gemini_audio(raw) if a.engine == "gemini" else raw
-            dur = to_wav(audio, tmp)
+            dur = to_wav(engine_audio(a.engine, raw), tmp)
             os.replace(tmp, dst)                       # a new take replaces the old one only when it is complete
         except QuotaSpent:
             spent = ln["id"]

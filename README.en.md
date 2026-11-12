@@ -28,7 +28,7 @@
 </p>
 <p align="center"><sub>30 seconds from films made with cinecode. Every frame is rendered from code in headless Chrome.</sub></p>
 
-It runs inside **Claude Code** (desktop app, VS Code extension, terminal) or **Cursor**, on your own computer. No paid service is required; a narrator, only if you want one, uses your own Gemini key (it has a free tier), ElevenLabs, or a free Turkish voice.
+It runs inside **Claude Code** (desktop app, VS Code extension, terminal) or **Cursor**, on your own computer. No paid service is required; a narrator, only if you want one, uses your own Gemini key (it has a free tier), the same Gemini voices through OpenRouter, ElevenLabs, or a free Turkish voice.
 
 ## What you can make
 
